@@ -102,13 +102,39 @@ def difficulty(n,boss):
         D.update(w=5.5+1.5*tier,locks=2+tier,ties=1+tier,cmin=14+2*tier,cmax=40+2*tier,spawn=0.03,hidden=0.18+0.03*tier)
     return D
 
-out=[]
-for n,L in enumerate(LEVELS,1):
-    D=difficulty(n,L['kind']=='boss')
-    TARGET=[0.75,0.5,0.4,0.32,0.25,0.3,0.25,0.2,0.17,0.12,0.15,0.12,0.1,0.08,0.06]
-    lv=make_level(L,D,TARGET[n-1]);out.append(lv)
+TARGET=[0.75,0.5,0.4,0.32,0.25,0.3,0.25,0.2,0.17,0.12,0.15,0.12,0.1,0.08,0.06]
+
+# levels that missed their target bot rate with the plain search (see CLAUDE.md, "What drives difficulty")
+TUNE={n:dict(rounds=12,cands=40,rare_keys=True) for n in ('Iceland','Europe','Egypt','Kenya','Sri Lanka')}
+for n in ('Iceland','Kenya'): TUNE[n].update(bot_games=150,tol=0.05)  # 60 games picked lucky layouts here (600-game check: 43%, 38%)
+for L in LEVELS:
+    if L['name'] in TUNE: L['tune']=TUNE[L['name']]
+
+def build_one(n):
+    L=LEVELS[n-1]; D=difficulty(n,L['kind']=='boss')
+    lv=make_level(L,D,TARGET[n-1])
     cnt=[lv['cells'].count(str(c)) for c in range(8)]
-    print(n,L['name'],'p=%.2f'%lv['p'],lv['D']['w'],lv['D']['locks'],lv['D']['ties'],lv['GW'],lv['GH'],len(lv['cells'])-lv['cells'].count('.'),cnt,'trays',sum(len(c) for c in lv['cols']),'att',lv['attempt'],D,file=sys.stderr)
-for lv in out: del lv['D']; del lv['attempt']; del lv['p']
-json.dump([lv.pop('sol') for lv in out],open('solutions.json','w'))
-json.dump(out,open('levels.json','w'),separators=(',',':'))
+    print(n,L['name'],'p=%.2f'%lv['p'],lv['D']['w'],lv['D']['locks'],lv['D']['ties'],lv['D'].get('key_mode','random'),lv['GW'],lv['GH'],len(lv['cells'])-lv['cells'].count('.'),cnt,'trays',sum(len(c) for c in lv['cols']),'att',lv['attempt'],file=sys.stderr,flush=True)
+    return lv
+
+def finish(lv):
+    for k in ('D','attempt','p'): del lv[k]
+    return lv.pop('sol'),lv
+
+if __name__=='__main__':
+    # python3 levels.py            rebuilds all levels
+    # python3 levels.py Egypt Kenya  rebuilds only those and merges them into the existing levels.json/solutions.json
+    names=sys.argv[1:]
+    if names:
+        import multiprocessing as mp
+        idx=[n for n,L in enumerate(LEVELS,1) if L['name'] in names]
+        assert len(idx)==len(names),'unknown level name'
+        out=json.load(open('levels.json')); sols=json.load(open('solutions.json'))
+        with mp.get_context('fork').Pool(len(idx)) as pool:
+            for n,lv in zip(idx,pool.map(build_one,idx)):
+                sols[n-1],out[n-1]=finish(lv)
+    else:
+        res=[finish(build_one(n)) for n in range(1,len(LEVELS)+1)]
+        sols=[s for s,_ in res]; out=[l for _,l in res]
+    json.dump(sols,open('solutions.json','w'))
+    json.dump(out,open('levels.json','w'),separators=(',',':'))

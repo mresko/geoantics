@@ -2,3 +2,4 @@ tools/*.geojson
 tools/topo.nc
 tools/topo.npz
 tools/__pycache__/
+.DS_Store

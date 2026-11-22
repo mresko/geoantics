@@ -1,4 +1,4 @@
-import json, math, random
+import json, math, random, heapq
 from shapely.geometry import shape, Point, box, LineString
 from shapely.ops import unary_union
 from shapely.prepared import prep
@@ -86,7 +86,19 @@ def build(L):
             x=i/scale;y=j/scale;x0=int(x);y0=int(y);fx=sm(x-x0);fy=sm(y-y0);v=lambda a,b:lat[b*nx+a]
             return v(x0,y0)*(1-fx)*(1-fy)+v(x0+1,y0)*fx*(1-fy)+v(x0,y0+1)*(1-fx)*fy+v(x0+1,y0+1)*fx*fy
         return f
-    sc=max(3,GW/14); n1=mknoise(sc); n2=mknoise(sc*.45); n3=mknoise(sc*1.3)
+    T=L['terrain']
+    # patch: <1 gives smaller forest/farmland patches (more natural boundaries between colours)
+    sc=max(3,GW/14)*T.get('patch',1); n1=mknoise(sc); n2=mknoise(sc*.45); n3=mknoise(sc*1.3)
+    # extra noise fields use their own rng so that switching them on leaves the rest of the map unchanged
+    rng2=random.Random(L['seed']+99)
+    def mknoise2(scale):
+        nx=int(GW/scale)+3; ny=int(GH/scale)+3; lat=[rng2.random() for _ in range(nx*ny)]
+        sm=lambda t:t*t*(3-2*t)
+        def f(i,j):
+            x=i/scale;y=j/scale;x0=int(x);y0=int(y);fx=sm(x-x0);fy=sm(y-y0);v=lambda a,b:lat[b*nx+a]
+            return v(x0,y0)*(1-fx)*(1-fy)+v(x0+1,y0)*fx*(1-fy)+v(x0,y0+1)*(1-fx)*fy+v(x0+1,y0+1)*fx*fy
+        return f
+    nh=mknoise2(sc*T.get('hedge_scale',1.6)); nh2=mknoise2(sc*T.get('hedge_scale',1.6)*0.8); no=mknoise2(max(1.5,sc*0.35))
     # distance to coast (bfs)
     from collections import deque
     dist=[-1]*(GW*GH); dq=deque()
@@ -102,22 +114,28 @@ def build(L):
             x,y=i+a,j+b
             if 0<=x<GW and 0<=y<GH and own[y*GW+x]>=0 and dist[y*GW+x]<0: dist[y*GW+x]=dist[id]+1;dq.append(y*GW+x)
     maxd=max(dist) or 1
-    T=L['terrain']
     g=[-1]*(GW*GH)
     for id in range(GW*GH):
         if own[id]<0: continue
         i,j=id%GW,id//GW; lon,lat=ll(i,j); pt=Point(lon,lat)
         e=elev(lon,lat); h=cell/k/3
         emax=max(e,*(elev(lon+a,lat+b) for a,b in((h,h),(-h,h),(h,-h),(-h,-h))))
-        ctx=dict(lat=lat,lon=lon,d=dist[id]/maxd,dc=dist[id],a=n1(i,j)*0.7+n2(i,j)*0.3,b=n2(i,j),c=n3(i,j),e=e)
+        ctx=dict(lat=lat,lon=lon,d=dist[id]/maxd,dc=dist[id],a=n1(i,j)*0.7+n2(i,j)*0.3-T.get('forest_bias',0),b=n2(i,j),c=n3(i,j),e=e)
         c=None
         if inside(TG,GL,pt) or emax>=T.get('white_m',2500): c=7
         elif e>=T.get('mtn_m',1000): c=5
         elif T.get('des',True) and inside(TD,DS,pt) and ctx['b']>0.15: c=6
-        if c is None: c=T['fn'](ctx)
+        if c is None:
+            c=T['fn'](ctx)
+            # hedge: forest belts winding through farmland (isolines of smooth noise), natural field boundaries
+            hw=T.get('hedge',0)
+            if c==2 and hw and (abs(nh(i,j)-0.5)<hw or abs(nh2(i,j)-0.5)<hw*T.get('hedge2',0)): c=1
+        # oasis: small farmland spots inside desert
+        if c==6 and no(i,j)<T.get('oasis',0): c=2
         if inside(TL,LK,pt) or (L['kind']!='boss' and inside(TL10,LK10,pt)): c=3
         g[id]=c
     # rivers
+    rivcells=set()
     for f in (RIV if L['kind']=='boss' else RIV10):
         if (f['properties'].get('scalerank') or 99)>T.get('river_rank',6 if L['kind']=='boss' else 9): continue
         if f['geometry'] is None: continue
@@ -135,7 +153,24 @@ def build(L):
                             for b in(-1,0,1):
                                 x,y=i+a,j+b
                                 if 0<=x<GW and 0<=y<GH and g[y*GW+x] in(6,1): g[y*GW+x]=2
-                    g[j*GW+i]=3
+                    g[j*GW+i]=3; rivcells.add(j*GW+i)
+    # riparian: forest strips along river banks where the river runs through farmland
+    if T.get('riparian'):
+        for id in list(rivcells):
+            i,j=id%GW,id//GW
+            for a,b in((1,0),(-1,0),(0,1),(0,-1)):
+                x,y=i+a,j+b
+                if 0<=x<GW and 0<=y<GH and g[y*GW+x]==2 and rng2.random()<T['riparian']: g[y*GW+x]=1
+    # river towns: real towns sitting on a river become city cells that cut the river
+    if T.get('river_towns'):
+        towns=sorted([f['properties'] for f in (PP if L['kind']=='boss' else PP10) if f['properties']['adm0_a3'] in set(a for a,_ in parts)],key=lambda p:-p['pop_max'])
+        done=0
+        for p in towns:
+            if done>=T['river_towns']: break
+            i=int((p['longitude']-minx)*k/cell); j=int((maxy-p['latitude'])/cell)
+            near=[(x,y) for x in range(i-1,i+2) for y in range(j-1,j+2) if 0<=x<GW and 0<=y<GH and y*GW+x in rivcells and g[y*GW+x]==3]
+            if near:
+                x,y=near[0]; g[y*GW+x]=4; done+=1
     # metropolitan areas
     if T.get('urban',True):
         for id in range(GW*GH):
@@ -173,23 +208,27 @@ def build(L):
     return GW,GH,g,own
 
 NB=((1,0),(-1,0),(0,1),(0,-1))
+SLOTS=5  # must match the 5 slots in index.html
+NCOL=8   # colour classes, must match COLORS in index.html
 class Sim:
-    """Deterministic eating model shared with the game: per colour FIFO queue of exposed cells."""
+    """Deterministic eating model shared with the game: per colour, ants eat the exposed cell
+    nearest the bottom centre of the map (squared distance, ties by cell index). Same key as LK in index.html."""
     def __init__(s,g,GW,GH):
-        s.g=g[:];s.GW=GW;s.GH=GH;s.q=[[] for _ in range(8)];s.h=[0]*8;s.exp=bytearray(len(g));s.left=0
+        s.g=g[:];s.GW=GW;s.GH=GH;s.q=[[] for _ in range(NCOL)];s.exp=bytearray(len(g));s.left=0
+        N=len(g); s.key=[((2*(id%GW)+1-GW)**2+(2*GH-2*(id//GW)-1)**2)*N+id for id in range(N)]
         for id,v in enumerate(s.g):
             if v>=0:
                 s.left+=1
-                if s.isexp(id): s.exp[id]=1; s.q[v].append(id)
+                if s.isexp(id): s.exp[id]=1; heapq.heappush(s.q[v],(s.key[id],id))
     def isexp(s,id):
         i,j=id%s.GW,id//s.GW
         for a,b in NB:
             x,y=i+a,j+b
             if x<0 or y<0 or x>=s.GW or y>=s.GH or s.g[y*s.GW+x]<0: return True
         return False
-    def avail(s,c): return len(s.q[c])-s.h[c]
+    def avail(s,c): return len(s.q[c])
     def pop(s,c):
-        id=s.q[c][s.h[c]]; s.h[c]+=1; s.eat(id); return id
+        id=heapq.heappop(s.q[c])[1]; s.eat(id); return id
     def eat(s,id):
         s.g[id]=-1;s.left-=1
         i,j=id%s.GW,id//s.GW
@@ -197,12 +236,12 @@ class Sim:
             x,y=i+a,j+b
             if 0<=x<s.GW and 0<=y<s.GH:
                 n=y*s.GW+x
-                if s.g[n]>=0 and not s.exp[n]: s.exp[n]=1; s.q[s.g[n]].append(n)
+                if s.g[n]>=0 and not s.exp[n]: s.exp[n]=1; heapq.heappush(s.q[s.g[n]],(s.key[n],n))
 
 def gen_trays(g,GW,GH,D,rng):
     s=Sim(g,GW,GH);seq=[];last=-1
     while s.left>0:
-        cand=[(c,min(s.avail(c),25)*(0.25 if c==last else 1)) for c in range(8) if s.avail(c)]
+        cand=[(c,min(s.avail(c),25)*(0.25 if c==last else 1)) for c in range(NCOL) if s.avail(c)]
         r=rng.random()*sum(w for _,w in cand); c=cand[0][0]
         for cc,w in cand:
             r-=w
@@ -230,7 +269,7 @@ def playout(g,GW,GH,cols,keymap,rng,pgood,record=None):
                     if p in keymap: unlocked.add(keymap[p])
             slots=[x for x in slots if x[1]>0]
         if s.left==0: return True
-        free=5-len(slots)
+        free=SLOTS-len(slots)
         if free<=0: return False
         tops={k:cs[k][0] for k in range(len(cs)) if cs[k]}
         def ok(k):
@@ -257,7 +296,10 @@ def solve(g,GW,GH,cols,keys,rng,tries=200,pgood=0.93):
         rec=[]
         if playout(g,GW,GH,cols,km,rng,pgood,rec): return rec
     return None
-def bot_rate(g,GW,GH,cols,keys,rng,n=30):
+LOCK_GAP=4       # padlocks at least this many trays apart (solution order and within a column)
+LOCK_MIN_ROW=3   # no padlock in the rows visible at the start (portrait and landscape both show 3)
+BOT_MIN=0.05     # naive bot must win at least 3 of 60 games
+def bot_rate(g,GW,GH,cols,keys,rng,n=60):
     km={k['cell']:k['lock'] for k in keys}
     return sum(playout(g,GW,GH,cols,km,rng,0.8) for _ in range(n))/n
 
@@ -301,33 +343,63 @@ def layout(g,GW,GH,D,rng):
     seq=gen_trays(g,GW,GH,D,rng); n=len(seq)
     keys=[];locks={};ties={}
     if D['locks']:
-        idxs=list(range(6,n)); rng.shuffle(idxs)
-        for li,p in enumerate(sorted(idxs[:D['locks']])):
-            src=rng.randint(max(0,p-8),p-2)
-            cells=[x for x in seq[src]['cells'] if g[x]!=0] or seq[src]['cells']
-            keys.append({'cell':rng.choice(cells),'lock':li}); locks[p]=li
+        # Siim's rules: padlocks never come in sequence (at least LOCK_GAP trays apart in solution order)
+        idxs=list(range(6,n)); rng.shuffle(idxs); picked=[]
+        for p in idxs:
+            if len(picked)>=D['locks']: break
+            if all(abs(p-q)>=LOCK_GAP for q in picked): picked.append(p)
+        for li,p in enumerate(sorted(picked)):
+            mode=D.get('key_mode','random')
+            if mode=='random':
+                src=rng.randint(max(0,p-8),p-2)
+                cells=[x for x in seq[src]['cells'] if g[x]!=0] or seq[src]['cells']
+                kc=rng.choice(cells)
+            else:
+                # 'rare': key in the chunk of the rarest colour within key_back colonies before the padlock;
+                # 'far': random chunk as usual. Both put the key on the chunk's last-eaten cell, the one
+                # farthest along its colour's eating order, so the colony that gets it must be timed.
+                win=range(max(0,p-D.get('key_back',8)),p-1)
+                if mode=='rare':
+                    total=lambda c:g.count(c) if c!=0 else 10**9
+                    src=min(win,key=lambda q:(total(seq[q]['c']),-q))
+                else: src=rng.choice(list(win))
+                cells=[x for x in seq[src]['cells'] if g[x]!=0] or seq[src]['cells']
+                kc=cells[-1]
+            keys.append({'cell':kc,'lock':li}); locks[p]=li
     tid=0; tries=0
     while tid<D['ties'] and tries<300:
         tries+=1
-        i=rng.randint(3,n-4); j=i+rng.randint(1,3)
+        i=rng.randint(3,n-4); j=i+rng.randint(*D.get('tie_span',(1,3)))  # partners 1-3 apart in solution order
         if j>=n or i in locks or j in locks or i in ties or j in ties: continue
+        # no tied colonies straight after a padlock
+        if any(0<i-p<=2 or 0<j-p<=2 for p in locks): continue
         if seq[i]['c']==seq[j]['c']: continue
         ties[i]=tid; ties[j]=tid; tid+=1
     for _try in range(80):
         order=sorted(range(n),key=lambda i:i+rng.random()*D['w'])
         ncol=D['cols'];cols=[[] for _ in range(ncol)]; colof={}; rowof={}
         for r,i in enumerate(order):
-            lens=[len(c) for c in cols]; opts=list(range(ncol))
+            lens=[len(c) for c in cols]; opts=list(range(ncol)); forced=False
             if i in ties:
                 partner=[q for q in ties if ties[q]==ties[i] and q!=i][0]
                 if partner in colof:
                     opts=[k for k in opts if abs(k-colof[partner])==1]
-                    near=[k for k in opts if abs(lens[k]-rowof[partner])<=5]
-                    if near: opts=near
-            m=min(lens[k] for k in opts); o2=[k for k in opts if lens[k]<=m+1]; k=rng.choice(o2)
+                    rmin,rmax=D.get('tie_rows',(0,5))  # row distance between partners (Siim: at most 5)
+                    near=[k for k in opts if rmin<=abs(lens[k]-rowof[partner])<=rmax]
+                    if near: opts=near; forced=rmin>0
+            if forced: k=rng.choice(opts)  # a minimum partner depth wins over keeping columns even
+            else: m=min(lens[k] for k in opts); o2=[k for k in opts if lens[k]<=m+1]; k=rng.choice(o2)
             rowof[i]=len(cols[k])
             cols[k].append([seq[i]['c'],len(seq[i]['cells']),locks.get(i,-1),ties.get(i,-1)]); colof[i]=k
-        okk=all(abs(rowof[a]-rowof[b])<=5 and abs(colof[a]-colof[b])==1 for a in ties for b in ties if a<b and ties[a]==ties[b])
+        rmin,rmax=D.get('tie_rows',(0,5))
+        okk=all(rmin<=abs(rowof[a]-rowof[b])<=rmax and abs(colof[a]-colof[b])==1 for a in ties for b in ties if a<b and ties[a]==ties[b])
+        # padlock rules as seen on screen: not in the rows visible at the start, never two in a row
+        # in one column, and the two colonies under a padlock are not tied
+        for p in locks:
+            col=cols[colof[p]]; r=rowof[p]
+            if r<LOCK_MIN_ROW: okk=False
+            if any(t[2]>=0 for t in col[max(0,r-LOCK_GAP+1):r]): okk=False
+            if any(t[3]>=0 for t in col[r+1:r+3]): okk=False
         if okk: break
     else:
         return None,None
@@ -336,25 +408,32 @@ def layout(g,GW,GH,D,rng):
 def make_level(L,D,target):
     GW,GH,g,own=build(L)
     D0=dict(D); D=dict(D); best=None; att=0
-    for rnd in range(6):
-        for c in range(8):
+    # per-level tuning from levels.py (tune=...): longer search and rare-colour keys when too easy.
+    # Levels without `tune` build exactly as before.
+    tune=L.get('tune',{})
+    for rnd in range(tune.get('rounds',10)):
+        for c in range(tune.get('cands',20)):
             att+=1; rng=random.Random(L['seed']*1000+att)
             cols,keys=layout(g,GW,GH,D,rng)
             if cols is None: continue
-            p=bot_rate(g,GW,GH,cols,keys,rng)
+            p=bot_rate(g,GW,GH,cols,keys,rng,n=tune.get('bot_games',60))  # more games = less luck in picking
+            if p<BOT_MIN: continue  # the naive bot must win sometimes, a solver-only win is not enough
             if best is not None and abs(p-target)>=best[0]: continue
             sol=solve(g,GW,GH,cols,keys,rng)
             if sol is None: continue
             best=(abs(p-target),p,cols,keys,dict(D),sol)
-        if best and abs(best[1]-target)<=0.1: break
-        if best and best[1]<target-0.1:
+        if best and abs(best[1]-target)<=tune.get('tol',0.1): break
+        if best is None or best[1]<target-0.1:
             D['w']=max(0,D['w']-2)
             if D['ties']>1: D['ties']-=1
             if D['locks']>1: D['locks']-=1
         else:
+            # harder: more shuffling and ties, but never more padlocks than the level's base number
             D['w']+=2.5
             if D['ties']>0: D['ties']=min(D0['ties']+2,D['ties']+1)
-            if D['locks']>0: D['locks']=min(D0['locks']+2,D['locks']+1)
+            # the strongest fair lever found: put padlock keys on a rare colour (see CLAUDE.md)
+            if tune.get('rare_keys') and D['locks']>0 and D.get('key_mode','random')=='random':
+                D['key_mode']='rare'; D['key_back']=12
     if best is None: raise Exception('unsolvable '+L['name'])
     _,p,cols,keys,D,sol=best
     hidden=make_fog(g,own,GW,GH,D,random.Random(L['seed']+5),keys)

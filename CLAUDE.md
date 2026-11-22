@@ -28,6 +28,8 @@ Concise, direct prose. No em dashes, few colons, no marketing language. Bold onl
 
 - **Difficulty**: he likes tough puzzles. Later levels should be hard. A naive bot winning about 15% or less is the right range.
 - **Landscape layout must never be easier than portrait**: both show exactly **3 rows** of trays.
+- **The naive bot must win sometimes** (at least 3 of 60 games). A level that only the strong solver can win is not acceptable.
+- **Padlock fairness** (v0.6): no padlock in the 3 rows visible at the start, padlocks at least 4 colonies apart (solution order and within a column), no tied colonies in the two places under a padlock, and the balancer never adds padlocks beyond the level's base number. Constants `LOCK_GAP`, `LOCK_MIN_ROW`, `BOT_MIN` in `tools/build.py`.
 - Colony size cap: 32 on early countries, rising slowly to 44 on the Asia boss. No huge trays (82 was rejected).
 - **No roads. No administrative borders inside countries.** Countries are divided by natural features (rivers, mountains). Continent bosses keep country borders as brown lines, which he liked.
 - **Terrain is driven by real elevation.** Lowlands are farmland, hills are forest, grey mountains appear only above a per-country height, and **white means glaciers or anything at or above 2500 m**. Do not overemphasise mountain ranges.
@@ -40,10 +42,10 @@ Concise, direct prose. No em dashes, few colons, no marketing language. Bold onl
 
 The game and the solver **must use identical eating rules**, otherwise a level that the solver marks solvable can be impossible in the game. This bug happened once: ants picked the nearest block on screen while the solver used a different order, and Europe became unwinnable.
 
-The shared rules, implemented in `index.html` (`lg`, `lq`, `lh`, `active`, `lEat`, `runLogic`) and in `tools/build.py` (`Sim`, `playout`):
+The shared rules, implemented in `index.html` (`lg`, `lq`, `LK`, `hpush`, `hpop`, `active`, `lEat`, `runLogic`) and in `tools/build.py` (`Sim`, `playout`):
 
-1. Each colour has a **FIFO queue of exposed cells**. Initially exposed cells are queued in ascending cell index. When a cell is eaten, its neighbours are checked in the order right, left, down, up (`NB`) and any non-empty, not-yet-queued neighbour is appended to its colour's queue.
-2. A tray eats from the head of its colour's queue.
+1. Each colour keeps a **priority queue (min-heap) of exposed cells**. A cell becomes exposed when it touches the sea or an eaten cell; when a cell is eaten, its neighbours (right, left, down, up, `NB`) that are non-empty and not yet queued join their colour's queue.
+2. A tray eats the queued cell **nearest the bottom centre of the map** (Siim's choice, v0.6). The key is `((2i+1-GW)^2 + (2GH-2j-1)^2) * cellCount + id`: squared distance from cell centre to the point (GW/2, GH), ties broken by lower cell index. Integer maths, so both sides agree exactly. Before v0.6 this was a FIFO queue seeded in cell-index order.
 3. Active trays are processed **in placement order** (not slot index), repeatedly, until no tray can progress.
 4. A tied pair is placed tapped tray first, partner second.
 5. A slot counts as free for logic as soon as its tray's remaining count reaches 0.
@@ -56,6 +58,9 @@ The game resolves the logic **instantly on tap**. Ants only animate the result (
 
 - `fetch_data.sh` downloads Natural Earth GeoJSON (10m and 50m: countries, admin-1, rivers, lakes, urban areas, glaciers, geography regions, populated places) from github.com/nvkelso/natural-earth-vector, plus a 10 arc-minute global elevation grid from github.com/fatiando-data/earth-topography-10arcmin, which it converts to `topo.npz`. Needs `shapely numpy netCDF4`.
 - `build.py` rasterises a country or continent to a grid, assigns terrain, generates trays, and verifies solvability. `levels.py` defines the 15 levels (terrain function, elevation thresholds `mtn_m`, facts, intro texts), the difficulty curve and the balancing targets. Run from inside `tools/`: `python3 levels.py`. It writes `levels.json` and `solutions.json` and takes several minutes.
+- Keep the downloaded data and a Python venv outside Google Drive (Drive would sync about 150 MB). Run the builder with the data folder as the working directory, e.g. `cd <data dir> && <venv>/bin/python3 <repo>/tools/levels.py`. It writes `levels.json` and `solutions.json` into that folder; copy them to `tools/`.
+- Any script that plays the game (replay test, bots) must set `AUTOPLAY=true` first. Otherwise its wins are saved as the player's cleared levels and best times.
+- The replay test needs Playwright. Without it, the same JS can be run in the Claude browser pane against `index.html`.
 - Then splice into the game with `python3 tools/splice_levels.py index.html tools/levels.json` and verify with `python3 tools/replay_test.py index.html tools/solutions.json`. Every level must end in `win`.
 
 How generation works:
@@ -65,6 +70,26 @@ How generation works:
 - **Trays**: a solution order is generated by repeatedly picking a colour with exposed cells and eating a chunk from its FIFO queue. Padlocks are placed 2 to 8 trays after their key's chunk. Ties link trays 1 to 3 apart in the solution order. The order is then shuffled within a window `w` and dealt into columns, respecting the tie column and row rules.
 - **Fog** is added after layout as bands, blobs and regions until it reaches the level's target share. It does not affect solvability.
 - **Verification and balancing**: each candidate layout is played 30 times by a naive bot (taps a tray whose colour can eat 80% of the time, otherwise random). A stronger solver (200 playouts, 93% greedy) must find a win, and that winning tap sequence is saved to `solutions.json`. The generator picks the candidate whose bot win rate is closest to the level's target (from 0.75 on Estonia down to 0.06 on Asia). If it is too easy, it raises `w` and adds padlocks or ties (only on levels where those mechanics are already introduced). If it is too hard, it eases off. Current reality: Estonia and Finland stay easy (no padlocks or ties to add), several late levels have a bot rate near 0 but a proven solution.
+
+## What drives difficulty (tested 2026-11-22, v0.6)
+
+Tested with `tools/probe.py` (60 layouts per variant, counts how many land in the target bot-rate band):
+
+- **The map barely matters.** Smaller forest/farmland patches (`patch`), forest belts through farmland (`hedge`, `hedge2`), riverside forest (`riparian`, more rivers via `river_rank`), towns cutting rivers (`river_towns`), more cities, lower `mtn_m`, desert oases (`oasis`) and more or less forest (`forest_bias`) all change the look but not the bot rate. These options stay in `build.py`, off by default, usable for looks.
+- **The eating rule barely matters**: the old FIFO rule and nearest-bottom-centre give the same spread on the same maps.
+- **4 slots instead of 5 and colonies 8 bigger barely matter** either.
+- **Bot results are bimodal per layout**: most layouts the bot wins nearly always, a few it nearly never wins. Losses are almost all structural: every top colony is padlocked, or a tied colony's partner is buried deeper in its column. "Slots full of colonies that cannot eat" (the only map-driven loss) is 0 to 5% of games. Levels without padlocks or ties (Estonia, Finland) are won by the bot practically always.
+- **3 slots is the one strong lever found** (probe, 8 off-target levels). Average bot rate: Africa 0.91 to 0.56, Europe 0.94 to 0.71, Finland 0.99 to 0.82, Kenya 0.93 to 0.82. Layouts the bot always wins drop sharply (Europe 40 of 60 to 0), so the balancer gets layouts in between to choose from. Little effect on Egypt, Sri Lanka, Iceland or Estonia.
+- **An extra colour alone is weak** (a 9th colour carved as patches from the biggest colour, 20 to 35%: averages drop 0 to 0.1). **Combined with 3 slots it is the strongest**: Europe 0.48 with 15 of 60 layouts in its band, Africa 0.44. A real extra colour would need a new terrain type in the palette and legend.
+- Probe options for these: `slots` and `extra` in `tools/probe.py`; `SLOTS` and `NCOL` constants in `build.py` (5 and 8, matching the game).
+- **Tied pairs do not give middling difficulty either.** More ties (+2, +4), partners forced 2 to 5 or 3 to 5 rows deeper (`tie_rows`), or partners further apart in solution order (`tie_span`) lower the average only by adding layouts the bot never wins (mostly unwinnable, rejected by the solver and `BOT_MIN`). Layouts in the target band stay at 0 to 1 of 60. Forcing deeper partners also makes many layouts impossible to deal. Options stay in `build.py`, off by default.
+- **What makes a layout hard (Europe 47% vs Asia 10%, same rules):** losses happen at one fixed tap in every game (Asia tap 51, Europe tap 105 of 113). The deciding factor is a padlock whose **key sits on a scarce colour far from the bottom centre**, e.g. Europe's key on one of only 6 glacier cells, in the far north. Ants eat the nearest cells first, so sending that colour's colonies early spends them on the near cells (the Alps). The only one left is then behind the padlock. Winners hold a colony of the key colour back until the key is next in line. Asia is harder because it has two such keys (glaciers, desert) and two tied pairs whose partners are buried at the same depth, so all four columns jam mid-game with nothing else to dig. Europe's trap only closes at the end. Which cell gets the key is random today (any non-border cell of a chunk 2 to 8 colonies before the padlock), so difficulty differs by build luck, not by continent.
+- **Key on a rare colour** (`key_mode='rare'`, `key_back=12`: key on the last-eaten cell of the rarest colour's chunk before the padlock) lowers the naive bot's average on Asia (0.79 to 0.46), Africa (0.91 to 0.64), Kenya (0.93 to 0.73), Sri Lanka (0.92 to 0.80), Egypt (0.90 to 0.81), and does nothing on Europe or Iceland. Like extra ties, it works mostly by adding layouts the bot never wins; layouts in the target band stay at 0 to 4 of 60. `key_mode='far'` (last cell of a random chunk) does little.
+- **Adding a rare 9th colour (4%, small patches)** alone does little. With the key on it, Sri Lanka 0.62, Africa 0.56, Kenya 0.78, Asia 0.62; same always/never pattern.
+- **Fog on the rarest colour cannot be measured with these bots.** The naive bot ignores the map, so fog changes nothing for it. A first planning bot (`smart_play` in `probe.py`: holds back a key-colour colony that cannot reach the key, counting only visible cells) plays worse than the naive one, so its fog results mean nothing. Measuring fog needs a properly strong planning bot first.
+- So with 5 slots, the bot either breezes through a layout or is stuck structurally.
+- **What worked to hit targets (v0.6 rebuild):** per-level `tune` in `levels.py` (`TUNE`): a longer search (`rounds=12, cands=40`) plus `rare_keys=True`, which switches padlock keys to a rare colour once the level comes out too easy. Measuring each candidate with more games (`bot_games=150`) and a tighter stop (`tol=0.05`) avoids picking layouts that only looked hard by luck (Iceland and Kenya first came out at 43% and 38% over 600 games). Results over 600 games: Iceland 30% (target 32), Europe 21% (25), Egypt 38% (30), Kenya 24% (25), Sri Lanka 8% (12). All padlock rules hold. Rebuild a subset with `python3 levels.py Iceland Kenya` (merges into the existing levels.json). Always confirm a rebuilt level's rate over 600 games.
+- Estonia and Finland cannot reach their targets without padlocks, ties, fewer slots or a new colour. Only fewer slots (3) creates layouts of middling difficulty. v0.5 met its targets largely by accepting near-zero layouts, which the `BOT_MIN` rule now rejects.
 
 ## Performance (fixed after lag on iPhone 15 Pro)
 
