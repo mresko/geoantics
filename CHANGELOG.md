@@ -4,6 +4,8 @@ All notable changes to GeoAntics. Versions follow `MAJOR.MINOR.PATCH`
 (see [CLAUDE.md](CLAUDE.md) for the rules). Each released version has a git tag `vX.Y[.Z]`.
 
 ## [Unreleased]
+- Added the level pipeline in `tools/` (builder, data download, level splicer, stored solutions, replay test) and `.gitignore` for the source data. The game itself is unchanged.
+- CLAUDE.md now holds the full project notes from the claude.ai chat plus the versioning rules.
 
 ## [0.5] - 2026-11-22
 - Baseline version moved from Cowork into this repo (`index.html`).
